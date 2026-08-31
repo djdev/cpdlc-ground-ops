@@ -9,4 +9,4 @@ if [ -d "$LOG_DIR" ]; then
     echo "Done."
 else
     echo "Unable."
-fi
+fi 
