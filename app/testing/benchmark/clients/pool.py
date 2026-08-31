@@ -1,13 +1,15 @@
 from __future__ import annotations
+
 import json
 import time
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, wait
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any
+
 from app.testing.benchmark.clients.controller import ControllerBenchmarkClient
 from app.testing.benchmark.clients.pilot import PilotBenchmarkClient
 from app.testing.benchmark.defaults import (
+    ADMISSION_TIMEOUT_S,
     CONNECT_TIMEOUT_S,
     MAX_CONNECT_WORKERS,
     POLL_INTERVAL_S,
@@ -16,6 +18,7 @@ from app.testing.benchmark.defaults import (
 from app.testing.benchmark.metrics.latency import ClientLatencyTracker
 from app.testing.benchmark.metrics.summary import summarize_latency
 from app.testing.benchmark.models import BenchmarkConfig, LatencyStats, MetricRow
+
 
 class MessageIdFactory:
     def __init__(self, test_id: str) -> None:
@@ -34,6 +37,7 @@ def _float_or_none(value: Any) -> float | None:
         return None
     return float(value)
 
+
 def _stats_from_server_snapshot(data: dict) -> LatencyStats:
     return LatencyStats(
         count=int(data.get("count") or 0),
@@ -44,10 +48,12 @@ def _stats_from_server_snapshot(data: dict) -> LatencyStats:
         max_ms=_float_or_none(data.get("max_ms")),
     )
 
+
 class ClientPool:
     def __init__(self) -> None:
         self.poll_interval_s = POLL_INTERVAL_S
         self.connect_timeout_s = CONNECT_TIMEOUT_S
+        self.admission_timeout_s = ADMISSION_TIMEOUT_S
         self.teardown_grace_s = TEARDOWN_GRACE_S
         self.max_connect_workers = MAX_CONNECT_WORKERS
 
@@ -55,12 +61,12 @@ class ClientPool:
         latency_tracker = ClientLatencyTracker()
         message_ids = MessageIdFactory(config.test_id)
         polling_issues = 0
+
         controllers: list[ControllerBenchmarkClient] = []
         pilots: list[PilotBenchmarkClient] = []
-        connected_pilots: list[PilotBenchmarkClient] = []
-        has_responder = False
-        message_phase_started = False
         admission_state: dict[str, Any] = {}
+        message_phase_started = False
+        has_responder = False
 
         try:
             try:
@@ -68,7 +74,7 @@ class ClientPool:
             except Exception:
                 polling_issues += 1
 
-            clean = self._wait_until_clean(config.server_url, timeout_s=5.0)
+            clean = self._wait_until_clean(config.server_url, timeout_s=10.0)
             if not clean:
                 state = self._safe_get_state(config.server_url) or {}
                 raise RuntimeError(
@@ -98,15 +104,13 @@ class ClientPool:
                 for i in range(config.pilots)
             ]
 
-            admission_timeout_s = self._admission_timeout_s(config)
-
             admission_state = self._connect_and_wait_for_admission(
                 controllers=controllers,
                 pilots=pilots,
                 server_url=config.server_url,
                 expected_atc=config.atc,
                 expected_pilots=config.pilots,
-                timeout_s=admission_timeout_s,
+                timeout_s=self.admission_timeout_s,
             )
 
             self._select_responder(controllers)
@@ -117,8 +121,11 @@ class ClientPool:
                 for controller in controllers
             )
 
-            if connected_pilots and has_responder:
+            admission_complete = bool(admission_state.get("admission_complete"))
+
+            if admission_complete and connected_pilots and has_responder:
                 message_phase_started = True
+                time.sleep(3.0)
                 self._run_message_phase(
                     pilots=connected_pilots,
                     duration_s=config.duration_s,
@@ -173,6 +180,7 @@ class ClientPool:
             observed_pilots = int(state.get("pilot_count") or 0)
             observed_total_clients = observed_atc + observed_pilots
             requested_total_clients = config.atc + config.pilots
+
             total_errors = int(metrics.get("total_errors") or 0)
 
             full_population_observed = (
@@ -185,6 +193,7 @@ class ClientPool:
 
             capacity_row_valid = (
                 full_population_observed
+                and message_phase_started
                 and has_end_to_end_samples
                 and has_server_samples
                 and total_errors == 0
@@ -196,6 +205,11 @@ class ClientPool:
                 observed_total_clients / requested_total_clients
                 if requested_total_clients > 0
                 else 0.0
+            )
+
+            not_observed_clients = max(
+                requested_total_clients - observed_total_clients,
+                0,
             )
 
             return MetricRow(
@@ -245,6 +259,8 @@ class ClientPool:
                     "requested_total_clients": requested_total_clients,
                     "observed_total_clients": observed_total_clients,
                     "admission_ratio": admission_ratio,
+                    "not_observed_clients": not_observed_clients,
+                    "not_observed_ratio": 1.0 - admission_ratio,
                     "drop_ratio": 1.0 - admission_ratio,
                     "full_population_observed": full_population_observed,
                     "has_end_to_end_samples": has_end_to_end_samples,
@@ -253,22 +269,27 @@ class ClientPool:
                 },
             )
 
+        except KeyboardInterrupt:
+            print("\nBenchmark interrupted by user.")
+            raise
+
         finally:
             self._disable_responders(controllers)
-            time.sleep(0.25)
 
-            self._disconnect_clients([*controllers, *pilots])
-            time.sleep(min(self.teardown_grace_s, 1.0))
+            try:
+                self._disconnect_clients([*controllers, *pilots])
+            except KeyboardInterrupt:
+                print("\nInterrupted during disconnect.")
+                raise
+            except Exception:
+                pass
 
             try:
                 self._post_json(config.server_url, "/testing/benchmark/reset")
             except Exception:
                 pass
 
-            self._wait_until_clean(config.server_url, timeout_s=3.0)
-
-    def _admission_timeout_s(self, config: BenchmarkConfig) -> float:
-        return max(self.connect_timeout_s, min(config.duration_s, 60.0))
+            self._wait_until_clean(config.server_url, timeout_s=5.0)
 
     def _run_message_phase(
         self,
@@ -302,26 +323,20 @@ class ClientPool:
         deadline = started_at + timeout_s
 
         clients = self._interleave_clients(controllers, pilots)
-        pending = list(clients)
+        requested_total = expected_atc + expected_pilots
 
         attempted_clients = 0
         last_state: dict[str, Any] = {}
         admission_complete = False
 
-        while pending and time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+        for start in range(0, len(clients), self.max_connect_workers):
+            if time.monotonic() >= deadline:
                 break
 
-            batch_size = min(self.max_connect_workers, len(pending))
-            batch = pending[:batch_size]
-            pending = pending[batch_size:]
+            batch = clients[start:start + self.max_connect_workers]
             attempted_clients += len(batch)
 
-            self._connect_batch_bounded(
-                clients=batch,
-                timeout_s=min(remaining, self.connect_timeout_s),
-            )
+            self._connect_batch_daemon(batch)
 
             state = self._safe_get_state(server_url)
             if state is not None:
@@ -334,7 +349,29 @@ class ClientPool:
                     admission_complete = True
                     break
 
-            time.sleep(0.05)
+            time.sleep(0.1)
+
+        while time.monotonic() < deadline:
+            state = self._safe_get_state(server_url)
+            if state is not None:
+                last_state = state
+
+                observed_atc = int(state.get("atc_count") or 0)
+                observed_pilots = int(state.get("pilot_count") or 0)
+
+                if observed_atc >= expected_atc and observed_pilots >= expected_pilots:
+                    admission_complete = True
+                    break
+
+            all_attempted_done = all(
+                client.connected or self._client_has_connect_error(client)
+                for client in clients[:attempted_clients]
+            )
+
+            if attempted_clients >= len(clients) and all_attempted_done:
+                break
+
+            time.sleep(self.poll_interval_s)
 
         final_state = self._safe_get_state(server_url)
         if final_state is not None:
@@ -342,17 +379,13 @@ class ClientPool:
 
         observed_atc = int(last_state.get("atc_count") or 0)
         observed_pilots = int(last_state.get("pilot_count") or 0)
-
-        elapsed_s = time.monotonic() - started_at
-        requested_total = expected_atc + expected_pilots
         observed_total = observed_atc + observed_pilots
 
         return {
             "admission_complete": admission_complete,
             "admission_timeout_s": timeout_s,
-            "admission_elapsed_s": elapsed_s,
+            "admission_elapsed_s": time.monotonic() - started_at,
             "attempted_clients": attempted_clients,
-            "pending_clients": len(pending),
             "requested_atc": expected_atc,
             "requested_pilots": expected_pilots,
             "requested_total_clients": requested_total,
@@ -364,6 +397,46 @@ class ClientPool:
             ),
             "state": last_state,
         }
+
+    def _connect_batch_daemon(self, clients: list[Any]) -> None:
+        threads: list[Thread] = []
+
+        for client in clients:
+            thread = Thread(
+                target=self._safe_connect_client,
+                args=(client,),
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+
+        deadline = time.monotonic() + self.connect_timeout_s + 1.0
+
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+
+    def _safe_connect_client(self, client: Any) -> None:
+        try:
+            client.connect(self.connect_timeout_s)
+        except Exception as exc:
+            try:
+                client.errors.append({"connect_thread_error": str(exc)})
+            except Exception:
+                pass
+
+    def _client_has_connect_error(self, client: Any) -> bool:
+        errors = getattr(client, "errors", []) or []
+        return any(
+            isinstance(error, dict)
+            and (
+                "connect_error" in error
+                or "connect_thread_error" in error
+            )
+            for error in errors
+        )
 
     def _interleave_clients(
         self,
@@ -381,33 +454,6 @@ class ClientPool:
 
         return clients
 
-    def _connect_batch_bounded(self, clients: list[Any], timeout_s: float) -> None:
-        if not clients:
-            return
-
-        workers = min(self.max_connect_workers, len(clients))
-        executor = ThreadPoolExecutor(max_workers=workers)
-
-        try:
-            futures = [
-                executor.submit(client.connect, self.connect_timeout_s)
-                for client in clients
-            ]
-
-            done, not_done = wait(futures, timeout=timeout_s)
-
-            for future in done:
-                try:
-                    future.result()
-                except Exception:
-                    pass
-
-            for future in not_done:
-                future.cancel()
-
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
     def _select_responder(self, controllers: list[ControllerBenchmarkClient]) -> None:
         for controller in controllers:
             controller.can_respond = False
@@ -417,10 +463,7 @@ class ClientPool:
                 controller.can_respond = True
                 return
 
-    def _disable_responders(
-        self,
-        controllers: list[ControllerBenchmarkClient],
-    ) -> None:
+    def _disable_responders(self, controllers: list[ControllerBenchmarkClient]) -> None:
         for controller in controllers:
             try:
                 controller.can_respond = False
@@ -428,40 +471,17 @@ class ClientPool:
                 pass
 
     def _disconnect_clients(self, clients: list[Any]) -> None:
-        if not clients:
-            return
+        deadline = time.monotonic() + min(self.teardown_grace_s, 3.0)
 
-        workers = min(self.max_connect_workers, len(clients))
-        executor = ThreadPoolExecutor(max_workers=workers)
+        for client in clients:
+            if time.monotonic() >= deadline:
+                return
 
-        try:
-            futures = [
-                executor.submit(self._safe_disconnect_client, client)
-                for client in clients
-            ]
-
-            done, not_done = wait(
-                futures,
-                timeout=min(self.teardown_grace_s, 3.0),
-            )
-
-            for future in done:
-                try:
-                    future.result()
-                except Exception:
-                    pass
-
-            for future in not_done:
-                future.cancel()
-
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-    def _safe_disconnect_client(self, client: Any) -> None:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
+            try:
+                if getattr(client, "connected", False):
+                    client.disconnect()
+            except Exception:
+                pass
 
     def _wait_until_clean(self, server_url: str, timeout_s: float) -> bool:
         deadline = time.monotonic() + timeout_s
@@ -545,4 +565,4 @@ class ClientPool:
     def _max_completed_cycles(self, pilots: list[PilotBenchmarkClient]) -> int:
         if not pilots:
             return 0
-        return max(pilot.completed_cycles for pilot in pilots)
+        return max(pilot.completed_cycles for pilot in pilots)  

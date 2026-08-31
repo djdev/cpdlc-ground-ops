@@ -80,14 +80,18 @@ class PilotBenchmarkClient:
             self._ready_for_next_request.set()
 
     def connect(self, timeout_s: float) -> bool:
+        self._connected_to_atc_event.clear()
+
         try:
             self.sio.connect(
                 self.server_url,
                 auth={"r": 0},
                 transports=["websocket"],
+                wait=True,
                 wait_timeout=timeout_s,
             )
             return self._connected_to_atc_event.wait(timeout_s)
+
         except Exception as exc:
             self.errors.append({"connect_error": str(exc)})
             return False

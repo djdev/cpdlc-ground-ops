@@ -59,14 +59,18 @@ class ControllerBenchmarkClient:
             self.errors.append(data)
 
     def connect(self, timeout_s: float) -> bool:
+        self._connected_event.clear()
+
         try:
             self.sio.connect(
                 self.server_url,
                 auth={"r": 1},
                 transports=["websocket"],
+                wait=True,
                 wait_timeout=timeout_s,
             )
             return self._connected_event.wait(timeout_s)
+
         except Exception as exc:
             self.errors.append({"connect_error": str(exc)})
             return False
